@@ -1,0 +1,51 @@
+# Build context is the api-gateway/ directory.
+# Run from the repo root: docker compose -f api-gateway/deploy/docker-compose.yml up --build
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      GATEWAY_ADDR: ":8098"
+      CHECK_ADDR: ":8099"
+      REDIS_ADDR: "redis:6379"
+      FAIL_OPEN: "true"
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose:
+      - "8098"
+      - "8099"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8099/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  traefik:
+    image: traefik:v3.1
+    command:
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:8080"
+      - "--entrypoints.dashboard.address=:8081"
+      - "--api.insecure=true"
+    ports:
+      - "8080:8080" # web entrypoint (the API gateway)
+      - "8081:8081" # Traefik dashboard
+    volumes:
+      - ./traefik:/etc/traefik/dynamic:ro
+    depends_on:
+      gateway:
+        condition: service_started

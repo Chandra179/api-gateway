@@ -1,0 +1,5 @@
+# Keep the build context small and reproducible.
+deploy/
+*.md
+.git
+.gitignore
