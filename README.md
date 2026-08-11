@@ -1,35 +1,40 @@
-# API Gateway: Distributed Rate Limiter
+# API Gateway: Consul Connect + Envoy mesh
 
-A working implementation of the [`rate-limiter.md`](../rate-limiter.md) design
-in **Go** + **Traefik**, structured as a **modular monolith**. It enforces the
-design's two limits per client, keeps the check at the edge, and fails open
-when the shared store is unavailable.
+A distributed system built in **Go**, fronted by a **Consul Connect / Envoy**
+service mesh. It started from the [`rate-limiter.md`](../rate-limiter.md)
+design (two limits per client, checked at the edge, fail-open) and is
+evolving into a production-oriented, multi-service gateway: services are
+independently deployable, routing is driven by **service discovery** (Consul),
+and transport between mesh members is **mTLS** (Consul Connect, Envoy sidecars)
+rather than plaintext.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Client([Client]) --> Traefik{"Traefik edge<br/>:8080"}
+    Client([Client]) --> IGW{"Envoy ingress gateway<br/>:8080"}
+    IGW -- "mTLS (Consul Connect)" --> Sidecar["Envoy sidecar"]
+    Sidecar --> Greet["greeting service<br/>:8098 /greet"]
 
-    Traefik -- "ForwardAuth: checkLimit(api_key)" --> Auth["Go rate-limit check<br/>:8099/auth"]
-    Auth -- "atomic Lua: token bucket + daily quota" --> Redis[(Redis<br/>:6379)]
-    Redis -- "allow / reject" --> Auth
+    Client -. "not yet meshed" .-> Check["Go rate-limit check<br/>:8099/auth"]
+    Check -- "atomic Lua: token bucket + daily quota" --> Redis[(Redis<br/>:6379)]
+    Redis -- "allow / reject" --> Check
 
-    Auth -- "200 -> forward" --> Mono["Modular Monolith (Go)<br/>:8098 /api/v1/*"]
-    Auth -. "429 -> reject" .-> Reject[["429 Too Many Requests"]]
-
-    Mono --> Greet[greeting module]
+    Consul[(Consul<br/>discovery + Connect CA)] -. "registers / discovers" .-> IGW
+    Consul -. "registers / discovers" .-> Sidecar
 ```
 
-Single Go process, two listeners:
+Two independent binaries today:
 
-| Listener | Port | Purpose |
-|----------|------|---------|
-| Check    | `:8099` | `POST` `/auth` consumed by Traefik's **ForwardAuth** middleware. Returns `200` to allow, `429` + `Retry-After` to reject. This is the `checkLimit(api_key) -> allow|reject` interface from the design. |
-| Gateway  | `:8098` | The protected module endpoints (e.g. `/api/v1/greet`) — the modular monolith behind the gateway. |
+| Binary       | Port    | Purpose |
+|--------------|---------|---------|
+| `gateway`    | `:8099` | `POST` `/auth`: `checkLimit(api_key) -> allow \| reject`. Plain HTTP for now — not yet part of the mesh (an `ext_authz` Envoy filter calling this service is a later phase). |
+| `greeting`   | `:8098` | Example standalone backend, reachable through the mesh only (`greeting-sidecar`'s Envoy proxy terminates mTLS on its behalf). |
 
-Traefik routes every `/api` request through the check **before** it reaches the
-monolith, so a rejected request never consumes app-server resources.
+The Envoy **ingress gateway** (Consul Connect) is the client-facing edge,
+replacing Traefik: it routes `:8080` traffic to `greeting` over the mesh per
+`deploy/consul/ingress-gateway.hcl`. `gateway` (the rate-limit check) is
+reachable directly on `:8099` in this phase, outside the mesh.
 
 ## How it implements the design
 
@@ -50,7 +55,8 @@ monolith, so a rejected request never consumes app-server resources.
 ## Layout
 
 ```
-cmd/gateway/            entrypoint: wires store + limiter + two HTTP listeners
+cmd/gateway/            entrypoint: rate-limit check service (plain HTTP, not yet meshed)
+cmd/greeting/           entrypoint: standalone greeting service (Consul Connect-enabled)
 internal/config/        env-driven configuration
 internal/ratelimit/     the rate limiter module
   limit.go              tiers + limits + Decision
@@ -59,61 +65,76 @@ internal/ratelimit/     the rate limiter module
   redis.go              RedisStore (primary)
   memory.go             MemoryStore (local dev / tests)
   limiter.go            fail-open / fail-closed policy
-internal/api/           gateway HTTP surface
-  auth.go               ForwardAuth handler (allow 200 / reject 429)
-  server.go             wires check + gateway listeners
-internal/module/        the modular monolith's vertical modules
-  greeting/             example protected endpoint
-deploy/                 Docker + Traefik + Redis
+internal/api/           check-service HTTP surface
+  auth.go               rate-limit handler (allow 200 / reject 429)
+  server.go             wires the check listener
+internal/httpserver/    shared HTTP server plumbing (both binaries)
+internal/discovery/     Consul (+ Connect) self-registration
+internal/module/        vertical service modules
+  greeting/             example backend, served by cmd/greeting
+deploy/                 Docker + Consul + Redis
   docker-compose.yml
-  traefik/dynamic.yml   edge router + ForwardAuth middleware
+  consul/ingress-gateway.hcl   ingress listener -> service routing
 ```
 
 ## Running
 
-### Quick start (full stack: Traefik + Redis + gateway)
+### Quick start (full stack: Consul mesh + Redis + gateway + greeting)
 
 ```bash
 make compose-up
 ```
 
-Then hit the gateway (Traefik :8080):
+Then hit `greeting` through the mesh (Envoy ingress gateway :8080). The
+ingress gateway routes by virtual host, so the request needs a `Host` header
+matching Consul's generated domain (`<service>.ingress.*`):
 
 ```bash
-# Allowed until the burst is exhausted.
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/v1/greet?name=world
-
-# Rapid-fire to trigger the rate limiter (429).
-for i in $(seq 1 200); do
-  curl -s -o /dev/null -w "%{http_code}\n" -H "X-API-Key: anon-key" \
-    http://localhost:8080/api/v1/greet?name=world
-done
+curl -H "Host: greeting.ingress.dc1.consul" "http://localhost:8080/greet?name=world"
 ```
 
-- Traefik dashboard: <http://localhost:8081/dashboard/>
+This dev-mode Consul (no ACLs) allows mesh traffic by default. To see
+enforcement in action, deny it explicitly and watch the request start
+failing (403), then delete the intention to restore the default-allow:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec consul consul intention create -deny ingress-gateway greeting
+docker compose -f deploy/docker-compose.yml exec consul consul intention delete ingress-gateway greeting
+```
+
+And the rate-limit check directly (not yet meshed):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-API-Key: anon-key" -X POST http://localhost:8099/auth
+```
+
+- Consul UI: <http://localhost:8500/ui/>
 - Gateway health: <http://localhost:8099/healthz>
 
 `make compose-down` stops the stack.
 
-### Local dev (no Docker, in-memory store)
+### Local dev (no Docker, no Consul)
 
 ```bash
-make run
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8098/api/v1/greet
+make run            # rate-limit check service, in-memory only if REDIS_ADDR unset/unreachable
+make run-greeting   # greeting service
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8098/greet
 ```
-
-The in-memory store limits a single process only; use Redis for real
-distributed deployments.
 
 ## Configuration (env vars)
 
-| Variable         | Default           | Description                                   |
-|------------------|-------------------|-----------------------------------------------|
-| `GATEWAY_ADDR`   | `:8098`           | Protected module API bind address             |
-| `CHECK_ADDR`     | `:8099`           | Rate-limit check bind address (ForwardAuth)   |
-| `REDIS_ADDR`     | `localhost:6379`  | Shared Redis; `none` selects the memory store |
-| `FAIL_OPEN`      | `true`            | Allow traffic when Redis is unavailable       |
-| `CHECK_TIMEOUT`  | `50ms`            | Per-check budget to protect the <5ms p99 goal |
+| Variable          | Default           | Description                                        |
+|-------------------|-------------------|-----------------------------------------------------|
+| `GREETING_ADDR`   | `:8098`           | greeting service bind address                       |
+| `CHECK_ADDR`      | `:8099`           | Rate-limit check bind address                        |
+| `REDIS_ADDR`      | `localhost:6379`  | Shared Redis                                          |
+| `FAIL_OPEN`       | `true`            | Allow traffic when Redis is unavailable               |
+| `CHECK_TIMEOUT`   | `50ms`            | Per-check budget to protect the <5ms p99 goal        |
+| `CONSUL_ENABLED`  | `false`           | Self-register with Consul                              |
+| `CONSUL_CONNECT`  | `false`           | Also register a managed Envoy sidecar (mTLS mesh)     |
+| `CONSUL_ADDR`     | `127.0.0.1:8500`  | Consul agent HTTP API address                          |
+| `SERVICE_NAME`    | *(per binary)*    | Consul service name to register under                 |
+| `ADVERTISE_ADDR`  | *(unset)*         | Address other mesh members use to reach this instance |
 
 ## Verify
 

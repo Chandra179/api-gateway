@@ -16,7 +16,10 @@ lint:
 run:
 	go run ./cmd/gateway
 
-# Full stack: Traefik edge + Redis + the gateway.
+run-greeting:
+	go run ./cmd/greeting
+
+# Full stack: Consul (Connect + Envoy mesh) + Redis + gateway + greeting.
 compose-up:
 	docker compose -f deploy/docker-compose.yml up --build
 

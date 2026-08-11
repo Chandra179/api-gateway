@@ -7,6 +7,11 @@ created: 2026-07-26
 
 # Rate Limiter
 
+> The check logic below is implemented as-is in `internal/ratelimit`. The
+> edge/transport it originally described (Traefik ForwardAuth) has since moved
+> to a Consul Connect + Envoy mesh — see [`README.md`](README.md) for the
+> current architecture.
+
 ## Scope & Requirements
 
 **Functional Requirements**

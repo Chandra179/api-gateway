@@ -1,11 +1,36 @@
 # Build context is the api-gateway/ directory.
 # Run from the repo root: docker compose -f api-gateway/deploy/docker-compose.yml up --build
+#
+# Topology: client -> ingress-gateway (Envoy, :8080) -> greeting-sidecar
+# (Envoy, mTLS) -> greeting. gateway (the rate-limit check service) is not
+# yet part of the mesh; it stays a plain HTTP service reachable at :8099
+# until ext_authz wiring lands in a later phase.
 services:
+  consul:
+    image: hashicorp/consul:1.19
+    command:
+      - "agent"
+      - "-server"
+      - "-bootstrap-expect=1"
+      - "-ui"
+      - "-client=0.0.0.0"
+      - "-hcl=connect { enabled = true }"
+      - "-hcl=ports { grpc = 8502 }"
+    ports:
+      - "8500:8500" # HTTP API + UI
+      - "8502:8502" # gRPC (xDS for Envoy)
+      - "8600:8600/udp" # DNS
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "6381:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -16,36 +41,144 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        SERVICE: gateway
     environment:
-      GATEWAY_ADDR: ":8098"
       CHECK_ADDR: ":8099"
       REDIS_ADDR: "redis:6379"
       FAIL_OPEN: "true"
+      CONSUL_ENABLED: "true"
+      CONSUL_ADDR: "consul:8500"
+      SERVICE_NAME: "gateway-check"
+      ADVERTISE_ADDR: "gateway"
     depends_on:
       redis:
         condition: service_healthy
-    expose:
-      - "8098"
-      - "8099"
+      consul:
+        condition: service_healthy
+    ports:
+      - "8099:8099"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8099/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
 
-  traefik:
-    image: traefik:v3.1
-    command:
-      - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--providers.file.watch=true"
-      - "--entrypoints.web.address=:8080"
-      - "--entrypoints.dashboard.address=:8081"
-      - "--api.insecure=true"
-    ports:
-      - "8080:8080" # web entrypoint (the API gateway)
-      - "8081:8081" # Traefik dashboard
-    volumes:
-      - ./traefik:/etc/traefik/dynamic:ro
+  greeting:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: greeting
+    environment:
+      GREETING_ADDR: ":8098"
+      CONSUL_ENABLED: "true"
+      CONSUL_CONNECT: "true"
+      CONSUL_ADDR: "consul:8500"
+      SERVICE_NAME: "greeting"
+      ADVERTISE_ADDR: "greeting"
     depends_on:
-      gateway:
+      consul:
+        condition: service_healthy
+    expose:
+      - "8098"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8098/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The hashicorp/consul image doesn't bundle the envoy binary, so the
+  # sidecar is two containers sharing a volume: this one asks Consul for the
+  # sidecar's bootstrap config, the next one runs Envoy against it.
+  greeting-sidecar-bootstrap:
+    image: hashicorp/consul:1.19
+    network_mode: "service:greeting"
+    volumes:
+      - greeting-envoy:/envoy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # Retries because greeting's own Consul registration (done from Go on
+      # startup) can race this container's start.
+      - 'until consul connect envoy -sidecar-for greeting -http-addr=consul:8500 -grpc-addr=consul:8502 -bootstrap > /envoy/bootstrap.json; do sleep 2; done'
+    depends_on:
+      greeting:
         condition: service_started
+      consul:
+        condition: service_healthy
+    restart: "no"
+
+  # Managed Envoy sidecar for greeting. Shares greeting's network namespace
+  # so Envoy can reach it at localhost:8098 and other mesh members can reach
+  # Envoy's mTLS listener.
+  greeting-sidecar:
+    image: envoyproxy/envoy:v1.29-latest
+    network_mode: "service:greeting"
+    volumes:
+      - greeting-envoy:/envoy:ro
+    command: ["envoy", "-c", "/envoy/bootstrap.json"]
+    depends_on:
+      greeting-sidecar-bootstrap:
+        condition: service_completed_successfully
+
+  # One-shot: writes the service-defaults (greeting's protocol) and
+  # ingress-gateway config entries into Consul. Exits after applying.
+  consul-config:
+    image: hashicorp/consul:1.19
+    volumes:
+      - ./consul:/etc/consul-entries:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "consul config write -http-addr=consul:8500 /etc/consul-entries/greeting-service-defaults.hcl && consul config write -http-addr=consul:8500 /etc/consul-entries/ingress-gateway.hcl"
+    depends_on:
+      consul:
+        condition: service_healthy
+    restart: "no"
+
+  # A stable network namespace (with a real, bindable IP) for the ingress
+  # gateway's bootstrap step and Envoy process to share — `consul connect
+  # envoy -gateway=ingress` needs a real interface address to register and
+  # bind its listener to, which a bare `envoyproxy/envoy` or throwaway
+  # bootstrap container can't provide on its own.
+  ingress-gateway-net:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    ports:
+      - "8080:8080"
+
+  ingress-gateway-bootstrap:
+    image: hashicorp/consul:1.19
+    network_mode: "service:ingress-gateway-net"
+    volumes:
+      - ingress-envoy:/envoy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # NOTE: -address's port intentionally differs from the ingress
+      # listener's real port (8080, set in ingress-gateway.hcl). Envoy
+      # bootstraps a static "ready" listener at exactly this address, which
+      # would otherwise collide with the real xDS-pushed listener once it
+      # binds :8080 on the same IP.
+      - 'consul connect envoy -gateway=ingress -register -service ingress-gateway -address "$(hostname -i):19191" -http-addr=consul:8500 -grpc-addr=consul:8502 -bootstrap > /envoy/bootstrap.json'
+    depends_on:
+      ingress-gateway-net:
+        condition: service_started
+      consul:
+        condition: service_healthy
+      consul-config:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # Client-facing edge: an Envoy ingress gateway, replacing Traefik.
+  ingress-gateway:
+    image: envoyproxy/envoy:v1.29-latest
+    network_mode: "service:ingress-gateway-net"
+    volumes:
+      - ingress-envoy:/envoy:ro
+    command: ["envoy", "-c", "/envoy/bootstrap.json"]
+    depends_on:
+      ingress-gateway-bootstrap:
+        condition: service_completed_successfully
+
+volumes:
+  greeting-envoy:
+  ingress-envoy:
